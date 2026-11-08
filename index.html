@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Poppy AR — test telefonu</title>
+<script>window.coi = { coepCredentialless: () => true, quiet: true };</script>
+<script src="coi-serviceworker.js"></script>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#2a2f3a; --text:#e8eaf0; --dim:#9aa3b2; --ok:#4cc38a; --warn:#e8b04b; --bad:#ef6b6b; --accent:#6ea8fe; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  main { max-width:640px; margin:0 auto; padding:16px; }
+  h1 { font-size:22px; margin:4px 0 2px; }
+  .sub { color:var(--dim); margin:0 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin:0 0 14px; }
+  .card h2 { font-size:16px; margin:0 0 10px; }
+  button { font:inherit; font-weight:600; border:0; border-radius:10px; padding:12px 14px; background:var(--accent); color:#0b1220; width:100%; margin:6px 0 0; }
+  button.secondary { background:#2a3140; color:var(--text); }
+  button:disabled { opacity:.45; }
+  select { font:inherit; width:100%; padding:10px; border-radius:10px; background:#222733; color:var(--text); border:1px solid var(--line); }
+  table { width:100%; border-collapse:collapse; }
+  td { padding:5px 0; border-bottom:1px solid var(--line); vertical-align:top; }
+  td:first-child { color:var(--dim); width:46%; padding-right:8px; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  video, canvas.preview { width:100%; border-radius:10px; background:#000; display:block; }
+  .out { white-space:pre-wrap; background:#11141a; border:1px solid var(--line); border-radius:10px; padding:10px; min-height:44px; margin-top:8px; font-size:14px; }
+  .bar { height:8px; background:#222733; border-radius:5px; overflow:hidden; margin-top:8px; }
+  .bar > div { height:100%; width:0; background:var(--accent); transition:width .2s; }
+  .log { font:12px/1.4 ui-monospace,monospace; color:var(--dim); white-space:pre-wrap; max-height:160px; overflow:auto; margin-top:8px; }
+  .row { display:flex; gap:8px; } .row > * { flex:1; }
+  .note { color:var(--dim); font-size:13px; margin-top:6px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Poppy AR — test telefonu</h1>
+  <p class="sub">Sprawdza, co potrafi ten telefon, i mierzy, jak szybko działa model AI. Najlepiej na Wi‑Fi (pobiera ok. 200–370 MB przy pierwszym uruchomieniu).</p>
+
+  <div class="card">
+    <h2>1. Możliwości telefonu</h2>
+    <table id="caps"><tr><td>Sprawdzanie…</td><td></td></tr></table>
+  </div>
+
+  <div class="card">
+    <h2>2. Kamera (480p)</h2>
+    <video id="video" playsinline muted></video>
+    <button id="camBtn">Włącz kamerę</button>
+    <p class="note">Model dostaje klatkę 480p z kamery (dłuższy bok 640 px).</p>
+  </div>
+
+  <div class="card">
+    <h2>3. Model AI</h2>
+    <select id="modelSel">
+      <option value="lfm">LFM2.5‑VL‑450M (mądrzejszy, ~315–365 MB)</option>
+      <option value="smol">SmolVLM‑256M (mniejszy, ~180 MB)</option>
+    </select>
+    <button id="loadBtn">Wczytaj model</button>
+    <div class="bar"><div id="bar"></div></div>
+    <div class="row">
+      <button id="descBtn" class="secondary" disabled>Opisz obraz</button>
+      <button id="cmdBtn" class="secondary" disabled>Test komendy</button>
+    </div>
+    <div class="out" id="answer">—</div>
+    <div class="log" id="log"></div>
+  </div>
+
+  <div class="card">
+    <h2>4. Mowa (po polsku)</h2>
+    <button id="micBtn" class="secondary">Powiedz komendę, np. „idź do przodu”</button>
+    <div class="out" id="speech">—</div>
+    <p class="note">Używa rozpoznawania mowy Google z telefonu (jeśli masz pobrany polski pakiet offline, działa bez internetu).</p>
+  </div>
+
+  <div class="card">
+    <h2>5. Wynik — zrób zrzut ekranu</h2>
+    <table id="results"><tr><td>Uruchom testy powyżej</td><td></td></tr></table>
+    <button id="copyBtn" class="secondary">Kopiuj wynik jako tekst</button>
+  </div>
+</main>
+
+<script type="module">
+const TJS = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.2";
+const $ = (id) => document.getElementById(id);
+const results = {};
+const caps = {};
+let stream = null, model = null, processor = null, loaded = null, tjs = null;
+
+function log(msg) { const el = $("log"); el.textContent += msg + "\n"; el.scrollTop = el.scrollHeight; }
+function setResult(key, value) { results[key] = value; renderTable($("results"), results); }
+function renderTable(table, obj) {
+  table.innerHTML = "";
+  for (const [k, v] of Object.entries(obj)) {
+    const tr = table.insertRow();
+    tr.insertCell().textContent = k;
+    const td = tr.insertCell();
+    if (typeof v === "object" && v) { td.textContent = v.text; td.className = v.cls || ""; } else td.textContent = String(v);
+  }
+}
+const yes = (t = "tak") => ({ text: t, cls: "ok" });
+const no = (t = "nie") => ({ text: t, cls: "bad" });
+const maybe = (t) => ({ text: t, cls: "warn" });
+
+// ---------- 1. capabilities ----------
+async function checkCaps() {
+  caps["Przeglądarka"] = navigator.userAgent.match(/(Chrome|Firefox|SamsungBrowser)\/[\d.]+/)?.[0] || "?";
+  caps["Pamięć RAM (szac.)"] = navigator.deviceMemory ? `${navigator.deviceMemory} GB+` : "?";
+  caps["Rdzenie CPU"] = navigator.hardwareConcurrency || "?";
+  caps["Bezpieczne połączenie"] = isSecureContext ? yes() : no("nie (kamera nie zadziała)");
+  let gpu = no("brak (wolniejszy tryb CPU)");
+  caps.f16 = false;
+  if (navigator.gpu) {
+    try {
+      const adapter = await navigator.gpu.requestAdapter();
+      if (adapter) {
+        caps.f16 = adapter.features.has("shader-f16");
+        const info = adapter.info || {};
+        gpu = yes(`tak${info.vendor ? " (" + [info.vendor, info.architecture].filter(Boolean).join(" ") + ")" : ""}${caps.f16 ? ", f16" : ""}`);
+      } else gpu = maybe("jest, ale brak karty");
+    } catch (e) { gpu = maybe("błąd: " + e.message); }
+  }
+  caps["WebGPU (AI na GPU)"] = gpu;
+  let ar = no();
+  if (navigator.xr) {
+    try { ar = (await navigator.xr.isSessionSupported("immersive-ar")) ? yes("tak (śledzenie podłogi)") : no("nie (będzie tryb bez śledzenia)"); }
+    catch (e) { ar = maybe("nie wiadomo"); }
+  } else ar = no("brak WebXR (będzie tryb bez śledzenia)");
+  caps["AR (WebXR)"] = ar;
+  caps["Rozpoznawanie mowy"] = window.AndroidSpeech ? (AndroidSpeech.available() ? yes("tak (Android)") : no("brak usługi mowy")) : (window.SpeechRecognition || window.webkitSpeechRecognition) ? yes() : no();
+  caps["Wielowątkowość"] = crossOriginIsolated ? yes() : maybe("nie (wolniej na CPU)");
+  caps["Żyroskop"] = ("DeviceOrientationEvent" in window) ? yes() : no();
+  const shown = { ...caps }; delete shown.f16;
+  renderTable($("caps"), shown);
+  for (const k of ["WebGPU (AI na GPU)", "AR (WebXR)", "Pamięć RAM (szac.)", "Wielowątkowość"]) setResult(k, shown[k]);
+}
+
+// ---------- 2. camera ----------
+$("camBtn").onclick = async () => {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    const v = $("video"); v.srcObject = stream; await v.play();
+    const t = stream.getVideoTracks()[0].getSettings();
+    setResult("Kamera", yes(`${t.width}×${t.height}`));
+    $("camBtn").textContent = "Kamera działa";
+  } catch (e) { setResult("Kamera", no(e.name)); }
+};
+function grabFrame() {
+  const v = $("video");
+  // keep the camera's aspect ratio (portrait phones give 480x640), long side 640
+  const k = v.videoWidth ? 640 / Math.max(v.videoWidth, v.videoHeight) : 1;
+  const c = document.createElement("canvas");
+  c.width = v.videoWidth ? Math.round(v.videoWidth * k) : 640; c.height = v.videoHeight ? Math.round(v.videoHeight * k) : 480;
+  const ctx = c.getContext("2d");
+  if (v.videoWidth) ctx.drawImage(v, 0, 0, c.width, c.height);
+  else { ctx.fillStyle = "#777"; ctx.fillRect(0, 0, 640, 480); ctx.fillStyle = "#c33"; ctx.fillRect(250, 180, 140, 140); }
+  return c;
+}
+
+// ---------- 3. model ----------
+const MODELS = {
+  lfm: { id: "onnx-community/LFM2.5-VL-450M-ONNX", name: "LFM2.5-VL-450M",
+         dtype: (gpu, f16) => gpu && f16 ? { embed_tokens: "fp16", decoder_model_merged: "q4f16", vision_encoder: "q4f16" }
+                                         : { embed_tokens: "fp16", decoder_model_merged: "q4", vision_encoder: "q4" } },
+  smol: { id: "HuggingFaceTB/SmolVLM-256M-Instruct", name: "SmolVLM-256M",
+          dtype: (gpu, f16) => gpu && f16 ? { embed_tokens: "fp16", decoder_model_merged: "q4f16", vision_encoder: "q4f16" }
+                                          : { embed_tokens: "int8", decoder_model_merged: "q4", vision_encoder: "q4" } },
+};
+
+$("loadBtn").onclick = async () => {
+  const key = $("modelSel").value, m = MODELS[key];
+  $("loadBtn").disabled = true; $("descBtn").disabled = $("cmdBtn").disabled = true;
+  $("answer").textContent = "Wczytywanie…";
+  const t0 = performance.now();
+  try {
+    tjs = tjs || await import(TJS);
+    const gpuOk = caps["WebGPU (AI na GPU)"]?.cls === "ok";
+    const device = gpuOk ? "webgpu" : "wasm";
+    log(`model ${m.name}, urządzenie ${device}, f16 ${caps.f16}`);
+    const files = {};
+    const progress = (p) => {
+      if (p.status === "progress" && p.total) { files[p.file] = [p.loaded, p.total];
+        const [a, b] = Object.values(files).reduce((s, [l, t]) => [s[0] + l, s[1] + t], [0, 0]);
+        $("bar").style.width = (100 * a / b).toFixed(1) + "%";
+        $("answer").textContent = `Pobieranie ${(a / 1e6).toFixed(0)} / ${(b / 1e6).toFixed(0)} MB`; }
+    };
+    processor = await tjs.AutoProcessor.from_pretrained(m.id, { progress_callback: progress });
+    const ip = processor.image_processor;
+    if (ip && "do_image_splitting" in ip) ip.do_image_splitting = false;
+    if (ip && "max_image_tokens" in ip) { ip.max_image_tokens = 64; ip.min_image_tokens = 64; }
+    const Cls = tjs.AutoModelForImageTextToText || tjs.AutoModelForVision2Seq;
+    try { model = await Cls.from_pretrained(m.id, { device, dtype: m.dtype(gpuOk, caps.f16), progress_callback: progress }); }
+    catch (e) {
+      if (device !== "webgpu") throw e;
+      log("WebGPU nie zadziałało (" + e.message + "), próbuję CPU");
+      model = await Cls.from_pretrained(m.id, { device: "wasm", dtype: m.dtype(false, false), progress_callback: progress });
+      caps["WebGPU (AI na GPU)"] = maybe("jest, ale model nie ruszył");
+    }
+    loaded = { ...m, key, device };
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    $("bar").style.width = "100%";
+    $("answer").textContent = `Model gotowy (${secs} s). Kliknij „Opisz obraz”.`;
+    setResult("Model", `${m.name} (${device})`);
+    setResult("Wczytanie modelu", `${secs} s`);
+    $("descBtn").disabled = $("cmdBtn").disabled = false;
+  } catch (e) {
+    $("answer").textContent = "Błąd wczytywania: " + e.message; log(e.stack || e);
+    setResult("Model", no("błąd: " + e.message.slice(0, 80)));
+  } finally { $("loadBtn").disabled = false; }
+};
+
+async function ask(text, maxTokens) {
+  const canvas = grabFrame();
+  const image = await tjs.RawImage.fromCanvas(canvas);
+  const messages = [{ role: "user", content: [{ type: "image" }, { type: "text", text }] }];
+  const prompt = processor.apply_chat_template(messages, { add_generation_prompt: true });
+  const t0 = performance.now();
+  const tp = performance.now();
+  const inputs = loaded.key === "smol" ? await processor(prompt, [image], { add_special_tokens: false })
+                                       : await processor(image, prompt, { add_special_tokens: false });
+  log(`obraz przygotowany w ${((performance.now() - tp) / 1000).toFixed(1)} s, tokenów wejścia ${inputs.input_ids.dims.at(-1)}`);
+  let first = null, n = 0, out = "";
+  const streamer = new tjs.TextStreamer(processor.tokenizer, { skip_prompt: true, skip_special_tokens: true,
+    callback_function: (s) => { if (first === null) first = performance.now(); n++; out += s; $("answer").textContent = out; } });
+  await model.generate({ ...inputs, max_new_tokens: maxTokens, do_sample: false, streamer });
+  const t1 = performance.now();
+  const ttft = ((first ?? t1) - t0) / 1000, gen = (t1 - (first ?? t1)) / 1000;
+  return { out: out.trim(), ttft, tps: n > 1 && gen > 0 ? (n - 1) / gen : 0, total: (t1 - t0) / 1000, imgTokens: inputs.pixel_values?.dims?.join("×") };
+}
+
+$("descBtn").onclick = async () => {
+  $("descBtn").disabled = $("cmdBtn").disabled = true; $("answer").textContent = "Myślę…";
+  try {
+    const r = await ask("Describe what you see in one or two short sentences.", 60);
+    log(`opis: start ${r.ttft.toFixed(1)} s, ${r.tps.toFixed(1)} słów/s, razem ${r.total.toFixed(1)} s, obraz ${r.imgTokens}`);
+    setResult("Opis: czas do 1. słowa", r.ttft < 4 ? yes(r.ttft.toFixed(1) + " s") : r.ttft < 10 ? maybe(r.ttft.toFixed(1) + " s") : no(r.ttft.toFixed(1) + " s"));
+    setResult("Opis: szybkość", `${r.tps.toFixed(1)} tokenów/s`);
+    setResult("Opis: łączny czas", `${r.total.toFixed(1)} s`);
+  } catch (e) { $("answer").textContent = "Błąd: " + e.message; log(e.stack || e); }
+  finally { $("descBtn").disabled = $("cmdBtn").disabled = false; }
+};
+
+const CMD_PROMPT = `You control a small walking robot standing in this room. The user said: "walk to the nearest object you see".
+Answer ONLY with JSON like {"action":"walk","turn_deg":-30,"distance_m":1.0,"target":"chair"}. action is one of walk, stop, turn, wave, stand_up.`;
+$("cmdBtn").onclick = async () => {
+  $("descBtn").disabled = $("cmdBtn").disabled = true; $("answer").textContent = "Myślę…";
+  try {
+    const r = await ask(CMD_PROMPT, 40);
+    let valid = false; try { valid = !!JSON.parse(r.out.match(/\{[\s\S]*\}/)?.[0] || "null")?.action; } catch {}
+    log(`komenda: start ${r.ttft.toFixed(1)} s, razem ${r.total.toFixed(1)} s, JSON ${valid}`);
+    setResult("Komenda: łączny czas", r.total < 6 ? yes(r.total.toFixed(1) + " s") : r.total < 15 ? maybe(r.total.toFixed(1) + " s") : no(r.total.toFixed(1) + " s"));
+    setResult("Komenda: poprawny JSON", valid ? yes() : maybe("nie (do poprawy douczaniem)"));
+  } catch (e) { $("answer").textContent = "Błąd: " + e.message; log(e.stack || e); }
+  finally { $("descBtn").disabled = $("cmdBtn").disabled = false; }
+};
+
+// ---------- 4. speech ----------
+$("micBtn").onclick = () => {
+  if (window.AndroidSpeech) {
+    const t0 = performance.now(); let done = false;
+    $("speech").textContent = "Słucham…";
+    window.onAndroidSpeech = (type, text) => {
+      if (type === "partial" || type === "final") $("speech").textContent = text || "…";
+      if (type === "final" && !done) { done = true; setResult("Mowa", yes(`„${text}” (${((performance.now() - t0) / 1000).toFixed(1)} s)`)); }
+      if (type === "error") { $("speech").textContent = "Błąd mowy: " + text; setResult("Mowa", no(text)); }
+    };
+    AndroidSpeech.start();
+    return;
+  }
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { setResult("Mowa", no("brak")); return; }
+  const rec = new SR(); rec.lang = "pl-PL"; rec.interimResults = true; rec.maxAlternatives = 1;
+  const t0 = performance.now(); let done = false;
+  $("speech").textContent = "Słucham…";
+  rec.onresult = (e) => {
+    const r = e.results[e.results.length - 1]; $("speech").textContent = r[0].transcript;
+    if (r.isFinal && !done) { done = true; setResult("Mowa", yes(`„${r[0].transcript}” (${((performance.now() - t0) / 1000).toFixed(1)} s)`)); }
+  };
+  rec.onerror = (e) => { $("speech").textContent = "Błąd: " + e.error; setResult("Mowa", no(e.error)); };
+  rec.start();
+};
+
+// ---------- 5. copy ----------
+$("copyBtn").onclick = async () => {
+  const text = Object.entries(results).map(([k, v]) => `${k}: ${typeof v === "object" ? v.text : v}`).join("\n")
+    + `\n${caps["Przeglądarka"]} | rdzenie ${caps["Rdzenie CPU"]}\n` + $("log").textContent;
+  try { await navigator.clipboard.writeText(text); $("copyBtn").textContent = "Skopiowano"; }
+  catch { $("answer").textContent = text; }
+};
+
+checkCaps();
+</script>
+</body>
+</html>
