@@ -131,19 +131,43 @@ async function startWebXR() {
   renderer.xr.setReferenceSpaceType("local");
   reticle = new THREE.Mesh(new THREE.RingGeometry(0.08, 0.1, 32).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: 0x6ea8fe }));
   reticle.matrixAutoUpdate = false; reticle.visible = false; scene.add(reticle);
-  const session = await navigator.xr.requestSession("immersive-ar", {
-    requiredFeatures: ["hit-test"], optionalFeatures: ["dom-overlay"], domOverlay: { root: $("overlay") } });
+  // try the full configuration first, then simpler ones (some phones refuse hit-test or dom-overlay)
+  const configs = [
+    { label: "pełne (podłoga + nakładka)", opts: { requiredFeatures: ["hit-test"], optionalFeatures: ["dom-overlay", "local-floor"], domOverlay: { root: $("overlay") } } },
+    { label: "podłoga bez nakładki", opts: { requiredFeatures: ["hit-test"] } },
+    { label: "bez wykrywania podłogi", opts: { optionalFeatures: ["hit-test", "local-floor", "dom-overlay"], domOverlay: { root: $("overlay") } } },
+    { label: "minimalne", opts: {} },
+  ];
+  let session = null, used = null; const errors = [];
+  for (const c of configs) {
+    try { session = await navigator.xr.requestSession("immersive-ar", c.opts); used = c; break; }
+    catch (e) { errors.push(`${c.label}: ${e.name}`); }
+  }
+  if (!session) throw new Error("telefon odrzucił każdą konfigurację AR (" + errors.join("; ") + "). Sprawdź w Sklepie Play „Usługi Google Play dla AR”");
+  mode = "WebXR: " + used.label;
   await renderer.xr.setSession(session);
-  const viewer = await session.requestReferenceSpace("viewer");
-  hitSource = await session.requestHitTestSource({ space: viewer });
+  try {
+    const viewer = await session.requestReferenceSpace("viewer");
+    hitSource = await session.requestHitTestSource({ space: viewer });
+  } catch { hitSource = null; }
+  const placeAhead = () => {
+    // no floor detection: put the robot 1.2 m ahead, 1.3 m below the phone's starting height
+    const cam = renderer.xr.getCamera();
+    const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(cam.quaternion); dir.y = 0; dir.normalize();
+    anchor.copy(cam.position).addScaledVector(dir, 1.2); anchor.y = cam.position.y - 1.3;
+  };
   session.addEventListener("select", () => {
-    if (!reticle.visible) return;
-    anchor.setFromMatrixPosition(reticle.matrix); heading = 0;
-    robot.visible = true; $("walkBtn").disabled = false;
-    status("Robot stoi na podłodze. Obejdź go dookoła. Stuknij w inne miejsce, żeby go przestawić.");
+    if (hitSource && reticle.visible) anchor.setFromMatrixPosition(reticle.matrix);
+    else if (!hitSource) placeAhead();
+    else return;
+    heading = 0; robot.visible = true; $("walkBtn").disabled = false;
+    status(hitSource ? "Robot stoi na podłodze. Obejdź go dookoła. Stuknij w inne miejsce, żeby go przestawić."
+                     : "Robot postawiony bez wykrycia podłogi (może wisieć lub być w podłodze). Obejdź go dookoła.");
   });
   session.addEventListener("end", () => { hitSource = null; status("Sesja AR zakończona. Kliknij Start, żeby wrócić."); $("startBtn").disabled = false; });
-  status("Powoli poruszaj telefonem, kierując go na podłogę. Gdy pojawi się niebieskie kółko, stuknij ekran.");
+  status(hitSource ? "Powoli poruszaj telefonem, kierując go na podłogę. Gdy pojawi się niebieskie kółko, stuknij ekran."
+                   : '<span class="warn">AR działa, ale bez wykrywania podłogi.</span> Stuknij ekran, żeby postawić robota przed sobą.'
+                     + (errors.length ? "<br><small>" + errors.join("; ") + "</small>" : ""));
   $("startBtn").disabled = true;
   let last = performance.now();
   renderer.setAnimationLoop((t, frame) => {
